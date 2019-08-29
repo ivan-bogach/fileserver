@@ -1,25 +1,335 @@
 package fileserver
 
 import (
+	"bytes"
+	"compress/gzip"
 	"fmt"
+	"html"
+	"io"
+	"mime"
+	"net/http"
+	"net/url"
+	"os"
+	pathpkg "path"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"golang.org/x/net/http/httpguts"
 )
 
-// type fileServer struct {
-// 	root http.FileSystem
-// 	// opt  FileServerOptions
-// }
+// FileServer returns a handler that serves HTTP requests
+// with the contents of the file system rooted at root.
+// Additional optional behaviors can be controlled via opt.
+func FileServer(root http.FileSystem, opt FileServerOptions) http.Handler {
+	if opt.ServeError == nil {
+		opt.ServeError = defaults.ServeError
+	}
+	return &fileServer{root: root, opt: opt}
+}
 
-// var defaults = FileServerOptions{
-// 	ServeError: NonSpecific,
-// }
+var defaults = FileServerOptions{
+	ServeError: NonSpecific,
+}
 
-// func FileServer(root http.FileSystem, opt FileServerOptions) http.Handler {
-// 	if opt.ServeError == nil {
-// 		opt.ServeError = defaults.ServeError
-// 	}
-// 	return &fileServer{root: root, opt: opt}
-// }
+// FileServerOptions specifies options for FileServer.
+type FileServerOptions struct {
+	// IndexHTML controls special handling of "index.html" file.
+	IndexHTML bool
 
-func print() {
-	fmt.Println("AKLJHKLKLJKLJKLJKLJKLJKLJ")
+	// ServeError is used to serve errors coming from underlying file system.
+	// If called, it's guaranteed to be before anything has been written
+	// to w by FileServer, so it's safe to use http.Error.
+	// If nil, then NonSpecific is used.
+	ServeError func(w http.ResponseWriter, req *http.Request, err error)
+}
+
+var (
+	// NonSpecific serves a non-specific HTTP error message and status code
+	// for a given non-nil error value. It's important that NonSpecific does not
+	// actually include err.Error(), since its goal is to not leak information
+	// in error messages to users.
+	NonSpecific = func(w http.ResponseWriter, req *http.Request, err error) {
+		switch {
+		case os.IsNotExist(err):
+			http.Error(w, "404 Not Found", http.StatusNotFound)
+		case os.IsPermission(err):
+			http.Error(w, "403 Forbidden", http.StatusForbidden)
+		default:
+			http.Error(w, "500 Internal Server Error", http.StatusInternalServerError)
+		}
+	}
+
+	// Detailed serves detailed HTTP error message and status code for a given
+	// non-nil error value. Because err.Error() is displayed to users, it should
+	// be used in development only, or if you're confident there won't be sensitive
+	// information in the underlying file system error messages.
+	Detailed = func(w http.ResponseWriter, req *http.Request, err error) {
+		switch {
+		case os.IsNotExist(err):
+			http.Error(w, "404 Not Found\n\n"+err.Error(), http.StatusNotFound)
+		case os.IsPermission(err):
+			http.Error(w, "403 Forbidden\n\n"+err.Error(), http.StatusForbidden)
+		default:
+			http.Error(w, "500 Internal Server Error\n\n"+err.Error(), http.StatusInternalServerError)
+		}
+	}
+)
+
+type fileServer struct {
+	root http.FileSystem
+	opt  FileServerOptions
+}
+
+func (fs *fileServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "GET" {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, "405 Method Not Allowed\n\nmethod should be GET", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Already cleaned by net/http.cleanPath, but caller can be some middleware.
+	path := pathpkg.Clean("/" + req.URL.Path)
+
+	if fs.opt.IndexHTML {
+		// Redirect .../index.html to .../.
+		// Can't use Redirect() because that would make the path absolute,
+		// which would be a problem running under StripPrefix.
+		if strings.HasSuffix(path, "/index.html") {
+			localRedirect(w, req, ".")
+			return
+		}
+	}
+
+	f, err := fs.root.Open(path)
+	if err != nil {
+		fs.opt.ServeError(w, req, err)
+		return
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		fs.opt.ServeError(w, req, err)
+		return
+	}
+
+	// Redirect to canonical path: / at end of directory url.
+	url := req.URL.Path
+	if fi.IsDir() {
+		if !strings.HasSuffix(url, "/") && url != "" {
+			localRedirect(w, req, pathpkg.Base(url)+"/")
+			return
+		}
+	} else {
+		if strings.HasSuffix(url, "/") && url != "/" {
+			localRedirect(w, req, "../"+pathpkg.Base(url))
+			return
+		}
+	}
+
+	if fs.opt.IndexHTML {
+		// Use contents of index.html for directory, if present.
+		if fi.IsDir() {
+			indexPath := pathpkg.Join(path, "index.html")
+			f0, err := fs.root.Open(indexPath)
+			if err == nil {
+				defer f0.Close()
+				fi0, err := f0.Stat()
+				if err == nil {
+					path = indexPath
+					f = f0
+					fi = fi0
+				}
+			}
+		}
+	}
+
+	// A directory?
+	if fi.IsDir() {
+		if checkLastModified(w, req, fi.ModTime()) {
+			return
+		}
+		err := dirList(w, f, path == "/")
+		if err != nil {
+			fs.opt.ServeError(w, req, err)
+		}
+		return
+	}
+
+	ServeContent(w, req, fi.Name(), fi.ModTime(), f)
+}
+
+func dirList(w http.ResponseWriter, f http.File, root bool) error {
+	dirs, err := f.Readdir(0)
+	if err != nil {
+		return fmt.Errorf("error reading directory: %v", err)
+	}
+	sort.Sort(byName(dirs))
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintln(w, "<pre>")
+	switch root {
+	case true:
+		fmt.Fprintln(w, `<a href=".">.</a>`)
+	case false:
+		fmt.Fprintln(w, `<a href="..">..</a>`)
+	}
+	for _, d := range dirs {
+		name := d.Name()
+		if d.IsDir() {
+			name += "/"
+		}
+		// name may contain '?' or '#', which must be escaped to remain
+		// part of the URL path, and not indicate the start of a query
+		// string or fragment.
+		url := url.URL{Path: name}
+		fmt.Fprintf(w, "<a href=\"%s\">%s</a>\n", url.String(), html.EscapeString(name))
+	}
+	fmt.Fprintln(w, "</pre>")
+	return nil
+}
+
+// localRedirect gives a Moved Permanently response.
+// It does not convert relative paths to absolute paths like http.Redirect does.
+func localRedirect(w http.ResponseWriter, req *http.Request, newPath string) {
+	if req.URL.RawQuery != "" {
+		newPath += "?" + req.URL.RawQuery
+	}
+	w.Header().Set("Location", newPath)
+	w.WriteHeader(http.StatusMovedPermanently)
+}
+
+var unixEpochTime = time.Unix(0, 0)
+
+// modTime is the modification time of the resource to be served, or IsZero().
+// return value is whether this request is now complete.
+func checkLastModified(w http.ResponseWriter, req *http.Request, modTime time.Time) bool {
+	if modTime.IsZero() || modTime.Equal(unixEpochTime) {
+		// If the file doesn't have a modTime (IsZero), or the modTime
+		// is obviously garbage (Unix time == 0), then ignore modtimes
+		// and don't process the If-Modified-Since header.
+		return false
+	}
+
+	// The Date-Modified header truncates sub-second precision, so
+	// use mtime < t+1s instead of mtime <= t to check for unmodified.
+	if t, err := time.Parse(http.TimeFormat, req.Header.Get("If-Modified-Since")); err == nil && modTime.Before(t.Add(1*time.Second)) {
+		h := w.Header()
+		delete(h, "Content-Type")
+		delete(h, "Content-Length")
+		w.WriteHeader(http.StatusNotModified)
+		return true
+	}
+	w.Header().Set("Last-Modified", modTime.UTC().Format(http.TimeFormat))
+	return false
+}
+
+// byName implements sort.Interface.
+type byName []os.FileInfo
+
+func (s byName) Len() int           { return len(s) }
+func (s byName) Less(i, j int) bool { return s[i].Name() < s[j].Name() }
+func (s byName) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+
+// GzipByter is implemented by compressed files for
+// efficient direct access to the internal compressed bytes.
+type GzipByter interface {
+	// GzipBytes returns gzip compressed contents of the file.
+	GzipBytes() []byte
+}
+
+// NotWorthGzipCompressing is implemented by files that were determined
+// not to be worth gzip compressing (the file size did not decrease as a result).
+type NotWorthGzipCompressing interface {
+	// NotWorthGzipCompressing is a noop. It's implemented in order to indicate
+	// the file is not worth gzip compressing.
+	NotWorthGzipCompressing()
+}
+
+// ServeContent is like http.ServeContent, except it applies gzip compression
+// if compression hasn't already been done (i.e., the "Content-Encoding" header is set).
+// It's aware of GzipByter and NotWorthGzipCompressing interfaces, and uses them
+// to improve performance when the provided content implements them. Otherwise,
+// it applies gzip compression on the fly, if it's found to be beneficial.
+func ServeContent(w http.ResponseWriter, req *http.Request, name string, modTime time.Time, content io.ReadSeeker) {
+	// If compression has already been dealt with, serve as is.
+	if _, ok := w.Header()["Content-Encoding"]; ok {
+		http.ServeContent(w, req, name, modTime, content)
+		return
+	}
+
+	// If request doesn't accept gzip encoding, serve without compression.
+	if !httpguts.HeaderValuesContainsToken(req.Header["Accept-Encoding"], "gzip") {
+		http.ServeContent(w, req, name, modTime, content)
+		return
+	}
+
+	// If the file is not worth gzip compressing, serve it as is.
+	if _, ok := content.(NotWorthGzipCompressing); ok {
+		w.Header()["Content-Encoding"] = nil
+		http.ServeContent(w, req, name, modTime, content)
+		return
+	}
+
+	// The following cases involve compression, so we want to detect the Content-Type eagerly,
+	// before passing it off to http.ServeContent. It's because http.ServeContent won't be able
+	// to easily detect the original content type after content has been gzip compressed.
+	// We do this even for the last case that serves uncompressed data so that it doesn't
+	// have to do duplicate work.
+	_, haveType := w.Header()["Content-Type"]
+	if !haveType {
+		ctype := mime.TypeByExtension(filepath.Ext(name))
+		if ctype == "" {
+			// Read a chunk to decide between utf-8 text and binary.
+			var buf [512]byte
+			n, _ := io.ReadFull(content, buf[:])
+			ctype = http.DetectContentType(buf[:n])
+			_, err := content.Seek(0, io.SeekStart) // Rewind to output whole file.
+			if err != nil {
+				http.Error(w, "500 Internal Server Error\n\nseeker can't seek", http.StatusInternalServerError)
+				return
+			}
+		}
+		w.Header().Set("Content-Type", ctype)
+	}
+
+	// If there are gzip encoded bytes available, use them directly.
+	if gzipFile, ok := content.(GzipByter); ok {
+		w.Header().Set("Content-Encoding", "gzip")
+		http.ServeContent(w, req, name, modTime, bytes.NewReader(gzipFile.GzipBytes()))
+		return
+	}
+
+	// Perform compression and serve gzip compressed bytes (if it's worth it).
+	if rs, err := gzipCompress(content); err == nil {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Cache-Control", "max-age=2592000")
+		http.ServeContent(w, req, name, modTime, rs)
+		return
+	}
+
+	// Serve as is.
+	w.Header()["Content-Encoding"] = nil
+	http.ServeContent(w, req, name, modTime, content)
+}
+
+// gzipCompress compresses input from r and returns it as an io.ReadSeeker.
+// It returns an error if compressed size is not smaller than uncompressed.
+func gzipCompress(r io.Reader) (io.ReadSeeker, error) {
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	n, err := io.Copy(gw, r)
+	if err != nil {
+		// No need to gw.Close() here since we're discarding the result, and gzip.Writer.Close isn't needed for cleanup.
+		return nil, err
+	}
+	err = gw.Close()
+	if err != nil {
+		return nil, err
+	}
+	if int64(buf.Len()) >= n {
+		return nil, fmt.Errorf("not worth gzip compressing: original size %v, compressed size %v", n, buf.Len())
+	}
+	return bytes.NewReader(buf.Bytes()), nil
 }
