@@ -254,7 +254,9 @@ type NotWorthGzipCompressing interface {
 // it applies gzip compression on the fly, if it's found to be beneficial.
 func ServeContent(w http.ResponseWriter, req *http.Request, name string, modTime time.Time, content io.ReadSeeker) {
 	// If compression has already been dealt with, serve as is.
+	w.Header().Set("Cache-Control", "max-age=2592000")
 	if _, ok := w.Header()["Content-Encoding"]; ok {
+
 		http.ServeContent(w, req, name, modTime, content)
 		return
 	}
@@ -304,11 +306,10 @@ func ServeContent(w http.ResponseWriter, req *http.Request, name string, modTime
 	// Perform compression and serve gzip compressed bytes (if it's worth it).
 	if rs, err := gzipCompress(content); err == nil {
 		w.Header().Set("Content-Encoding", "gzip")
-		w.Header().Set("Cache-Control", "max-age=2592000")
 		http.ServeContent(w, req, name, modTime, rs)
 		return
 	}
-
+	fmt.Println("Serve as is")
 	// Serve as is.
 	w.Header()["Content-Encoding"] = nil
 	http.ServeContent(w, req, name, modTime, content)
